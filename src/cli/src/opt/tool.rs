@@ -379,6 +379,11 @@ pub enum HimmelblauUnixOpt {
     /// Test authentication of a user via the himmelblaud resolver "pam" channel. This does not
     /// test that your pam configuration is correct - only that himmelblaud is correctly processing
     /// and validating authentications.
+    ///
+    /// Phone passkeys are supported through a QR code displayed in the terminal when
+    /// enable_passwordless_qr_bluetooth is enabled and Bluetooth is powered on.
+    /// Use a UTF-8 terminal with ANSI color support and a monospace font.
+    /// Use --force-reauth to bypass a cached Hello PIN and exercise the full authentication flow.
     AuthTest {
         #[clap(short, long)]
         debug: bool,

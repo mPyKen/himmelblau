@@ -72,6 +72,18 @@ fn validate_hsm_pin_path(hsm_pin_path: &str) -> Result<PathBuf, Box<dyn Error>> 
     Ok(canonical)
 }
 
+/// Returns whether a PIN path is provided as a decrypted systemd service credential.
+pub fn is_systemd_credential(hsm_pin_path: &str) -> bool {
+    let Some(credentials_directory) = std::env::var_os("CREDENTIALS_DIRECTORY") else {
+        return false;
+    };
+    is_systemd_credential_path(Path::new(hsm_pin_path), Path::new(&credentials_directory))
+}
+
+fn is_systemd_credential_path(hsm_pin_path: &Path, credentials_directory: &Path) -> bool {
+    hsm_pin_path.starts_with(credentials_directory)
+}
+
 pub fn decrypt_hsm_pin(hsm_pin_path: &str) -> Result<Zeroizing<Vec<u8>>, Box<dyn Error>> {
     let validated_path = validate_hsm_pin_path(hsm_pin_path)?;
     let mut child = Command::new("systemd-creds")
@@ -198,40 +210,41 @@ macro_rules! tpm_init {
     ($cfg:ident, $on_error:expr) => {{
         use himmelblau_unix_common::constants::DEFAULT_HSM_PIN_PATH_ENC;
         use himmelblau_unix_common::tpm::{
-            decrypt_hsm_pin, open_tpm, open_tpm_if_possible, read_hsm_pin, write_hsm_pin,
+            decrypt_hsm_pin, is_systemd_credential, open_tpm, open_tpm_if_possible, read_hsm_pin,
+            write_hsm_pin,
         };
         use himmelblau_unix_common::unix_config::HsmType;
         use kanidm_hsm_crypto::AuthValue;
 
-        // Check for an existing encrypted hsm pin. If present, we MUST be root
-        // to decrypt it (aad-tool will use this, or himmelblaud started with
-        // `skip-root-check`).
-        let hsm_pin = match decrypt_hsm_pin(DEFAULT_HSM_PIN_PATH_ENC) {
-            Ok(hsm_pin) => hsm_pin,
-            Err(e) => {
-                // Himmelblaud might still read the decrypted PIN from systemd
-                // later, so we don't want this message explicitly printed to debug.
-                trace!("Failed reading encrypted HSM PIN: {}", e);
-
-                // Check for and create the hsm pin if required.
-                if let Err(err) = write_hsm_pin(&$cfg.get_hsm_pin_path()).await {
+        let hsm_pin_path = $cfg.get_hsm_pin_path();
+        let hsm_pin = if is_systemd_credential(&hsm_pin_path) {
+            match read_hsm_pin(&hsm_pin_path).await {
+                Ok(hsm_pin) => hsm_pin,
+                Err(err) => {
                     error!(
                         ?err,
-                        "Failed to create HSM PIN into {}",
-                        &$cfg.get_hsm_pin_path()
+                        "Failed to read HSM PIN from systemd credential {}", hsm_pin_path
                     );
                     $on_error
-                };
-                // read the hsm pin
-                match read_hsm_pin(&$cfg.get_hsm_pin_path()).await {
-                    Ok(hp) => hp,
-                    Err(err) => {
-                        error!(
-                            ?err,
-                            "Failed to read HSM PIN from {}",
-                            &$cfg.get_hsm_pin_path()
-                        );
+                }
+            }
+        } else {
+            // Non-systemd callers may need to decrypt the stored PIN themselves.
+            match decrypt_hsm_pin(DEFAULT_HSM_PIN_PATH_ENC) {
+                Ok(hsm_pin) => hsm_pin,
+                Err(e) => {
+                    trace!("Failed reading encrypted HSM PIN: {}", e);
+
+                    if let Err(err) = write_hsm_pin(&hsm_pin_path).await {
+                        error!(?err, "Failed to create HSM PIN into {}", hsm_pin_path);
                         $on_error
+                    };
+                    match read_hsm_pin(&hsm_pin_path).await {
+                        Ok(hsm_pin) => hsm_pin,
+                        Err(err) => {
+                            error!(?err, "Failed to read HSM PIN from {}", hsm_pin_path);
+                            $on_error
+                        }
                     }
                 }
             }
@@ -256,6 +269,29 @@ macro_rules! tpm_init {
 
         (auth_value, hsm)
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_systemd_credential_path;
+    use std::path::Path;
+
+    #[test]
+    fn recognizes_paths_within_the_systemd_credentials_directory() {
+        let credentials_directory = Path::new("/run/credentials/example.service");
+        assert!(is_systemd_credential_path(
+            &credentials_directory.join("hsm-pin"),
+            credentials_directory
+        ));
+        assert!(!is_systemd_credential_path(
+            Path::new("/run/credentials/example.service-evil/hsm-pin"),
+            credentials_directory
+        ));
+        assert!(!is_systemd_credential_path(
+            Path::new("/var/lib/himmelblaud/hsm-pin"),
+            credentials_directory
+        ));
+    }
 }
 
 #[macro_export]

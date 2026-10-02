@@ -28,7 +28,7 @@ _workspace_version() {
 
 pkgname=himmelblau
 pkgver="$(_workspace_version)"
-pkgrel=1
+pkgrel=2
 pkgdesc="Azure Entra ID authentication for Linux (daemon, PAM, NSS, broker, SSO)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/himmelblau-idm/himmelblau"

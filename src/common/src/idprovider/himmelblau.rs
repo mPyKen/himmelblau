@@ -33,6 +33,7 @@ use crate::idprovider::common::build_online_probe_client;
 use crate::idprovider::common::flip_displayname_comma;
 use crate::idprovider::common::sealed_refresh_token_or;
 use crate::idprovider::common::should_block_hello_pin_attempts;
+use crate::idprovider::common::HelloPrtRenewalError;
 use crate::idprovider::common::KeyType;
 use crate::idprovider::common::RefreshCacheEntry;
 use crate::idprovider::common::TotpEnrollmentRecord;
@@ -53,7 +54,7 @@ use crate::{
     impl_himmelblau_offline_auth_step, impl_himmelblau_try_unseal, impl_offline_break_glass,
     impl_probe_online, impl_provision_hello_key, impl_provision_or_create_hello_key,
     impl_setup_hello_totp_with_storage_key, impl_unix_user_access, load_cached_prt,
-    load_cached_prt_for_try_unseal, seal_prt_with_existing_hello_key,
+    load_cached_prt_for_try_unseal, renew_decoupled_hello_prt, seal_prt_with_existing_hello_key,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -2645,8 +2646,36 @@ impl IdProvider for HimmelblauProvider {
                             )
                         })
                     };
-                    if let Some(RefreshCacheEntry::Prt(prt)) = refresh_cache_entry {
+                    if let Some(RefreshCacheEntry::Prt(mut prt)) = refresh_cache_entry {
                         prt_cache_update = PrtCacheUpdate::Reused;
+                        match renew_decoupled_hello_prt!(
+                            self,
+                            account_id,
+                            &prt,
+                            &$loaded_hello_key,
+                            keystore,
+                            tpm,
+                            machine_key,
+                            self.client.lock().await.exchange_prt_for_prt(
+                                &prt, tpm, machine_key, true,
+                            )
+                        ).await {
+                            Ok(Some(renewed)) => {
+                                prt = renewed;
+                                prt_cache_update = PrtCacheUpdate::Fresh;
+                                info!("Renewed and persisted Hello PRT for {}", account_id);
+                            }
+                            Ok(None) => {}
+                            Err(HelloPrtRenewalError::Renewal(MsalError::RequestFailed(msg))) => {
+                                let url = extract_base_url!(msg);
+                                warn!(?url, "Hello PRT renewal unavailable; checking existing credential");
+                            }
+                            Err(HelloPrtRenewalError::Renewal(e)) => {
+                                warn!(?e, "Hello PRT renewal requires reauthentication");
+                                request_reauth!($cred.clone());
+                            }
+                            Err(HelloPrtRenewalError::Persistence(e)) => return Err(e),
+                        }
                         let prt_exchange_result = self
                             .client
                             .lock()

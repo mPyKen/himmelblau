@@ -339,10 +339,34 @@ impl Drop for FidoUsbSession {
     }
 }
 
+/// The commercial cloud uses a WebAuthn RP ID distinct from its authority.
+/// Other clouds use their configured authority host for the RP ID.
+#[derive(Debug, PartialEq, Eq)]
+struct FidoRelyingParty {
+    id: String,
+    origin: String,
+}
+
+fn fido_relying_party(authority_host: &str) -> FidoRelyingParty {
+    let id = if authority_host.eq_ignore_ascii_case("login.microsoftonline.com") {
+        "login.microsoft.com"
+    } else {
+        authority_host
+    };
+    // RP IDs are hashed as bytes, unlike case-insensitive DNS hostnames.
+    let id = id.to_ascii_lowercase();
+    FidoRelyingParty {
+        origin: format!("https://{id}"),
+        id,
+    }
+}
+
+#[allow(clippy::unwrap_used)]
 pub fn fido_auth(
     msg_printer: Arc<dyn MessagePrinter>,
     fido_challenge: String,
     fido_allow_list: Vec<String>,
+    authority_host: &str,
     timeout_ms: u64,
     prompt: &str,
     presence_prompt: &str,
@@ -356,6 +380,7 @@ pub fn fido_auth(
             msg_printer,
             fido_challenge,
             fido_allow_list,
+            authority_host,
             timeout_ms,
             prompt,
             presence_prompt,
@@ -368,10 +393,12 @@ async fn fido_auth_inner(
     msg_printer: Arc<dyn MessagePrinter>,
     fido_challenge: String,
     fido_allow_list: Vec<String>,
+    authority_host: &str,
     timeout_ms: u64,
     prompt: &str,
     presence_prompt: &str,
 ) -> Result<String, PamResultCode> {
+    let rp = fido_relying_party(authority_host);
     msg_printer.print_text(&format!("[FIDO_INSERT] {}", prompt));
 
     let mut manager = AuthenticatorService::new().map_err(|e| {
@@ -383,7 +410,7 @@ async fn fido_auth_inner(
     let challenge_str = json_to_string(&json!({
         "type": "webauthn.get",
         "challenge": URL_SAFE_NO_PAD.encode(fido_challenge),
-        "origin": "https://login.microsoft.com"
+        "origin": &rp.origin
     }))
     .map_err(|e| {
         error!("{:?}", e);
@@ -411,8 +438,8 @@ async fn fido_auth_inner(
     let chall_bytes = Sha256::digest(challenge_str.clone()).into();
     let ctap_args = SignArgs {
         client_data_hash: chall_bytes,
-        origin: "https://login.microsoft.com".to_string(),
-        relying_party_id: "login.microsoft.com".to_string(),
+        origin: rp.origin,
+        relying_party_id: rp.id,
         allow_list,
         user_verification_req: UserVerificationRequirement::Preferred,
         user_presence_req: true,
@@ -712,17 +739,9 @@ async fn probe_bluetooth_with(probe: impl Future<Output = BluetoothState>) -> Bl
 }
 
 async fn check_bluetooth_on_connection(conn: &zbus::Connection) -> BluetoothState {
-    let builder = match zbus::fdo::ObjectManagerProxy::builder(conn)
+    let proxy = match zbus::fdo::ObjectManagerProxy::builder(conn)
         .destination("org.bluez")
-        .and_then(|b| b.path("/"))
-    {
-        Ok(p) => p,
-        Err(e) => {
-            debug!("BlueZ not available on D-Bus: {:?}", e);
-            return BluetoothState::NoAdapter;
-        }
-    };
-    let proxy = match builder
+        .path("/")
         .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await
@@ -737,7 +756,7 @@ async fn check_bluetooth_on_connection(conn: &zbus::Connection) -> BluetoothStat
         .inner()
         .call_with_flags::<_, _, zbus::fdo::ManagedObjects>(
             "GetManagedObjects",
-            zbus::proxy::MethodFlags::NoAutoStart.into(),
+            zbus::proxy::MethodFlags::NO_AUTO_START,
             &(),
         )
         .await
@@ -779,6 +798,7 @@ async fn check_bluetooth_on_connection(conn: &zbus::Connection) -> BluetoothStat
 async fn qr_bluetooth_fido_auth(
     msg_printer: Arc<dyn MessagePrinter>,
     fido_challenge: String,
+    authority_host: &str,
     qr_prompt: &str,
 ) -> Result<String, PamResultCode> {
     let device = CableQrCodeDevice::new_transient(
@@ -794,13 +814,18 @@ async fn qr_bluetooth_fido_auth(
     let message = qr_bluetooth_message(msg_printer.as_ref(), qr_prompt, &qr_url)?;
     msg_printer.print_sensitive(&message);
     // Protocol tasks do not own PAM callbacks and can progress during PIN input.
-    let mut qr = FidoTask::spawn(qr_bluetooth_assertion(device, fido_challenge));
+    let mut qr = FidoTask::spawn(qr_bluetooth_assertion(
+        device,
+        fido_challenge,
+        fido_relying_party(authority_host),
+    ));
     qr.result().await
 }
 
 async fn qr_bluetooth_assertion(
     mut device: CableQrCodeDevice,
     fido_challenge: String,
+    rp: FidoRelyingParty,
 ) -> Result<String, PamResultCode> {
     // Channel creation starts the connection task; the caller bounds the
     // scan/handshake and assertion together with wait_for_fido.
@@ -815,9 +840,9 @@ async fn qr_bluetooth_assertion(
     // Empty allowList forces the phone to use a discoverable credential,
     // which includes userHandle (required by Entra to identify the user).
     let request = GetAssertionRequest {
-        relying_party_id: "login.microsoft.com".to_string(),
+        relying_party_id: rp.id,
         challenge: fido_challenge.as_bytes().to_vec(),
-        origin: "https://login.microsoft.com".to_string(),
+        origin: rp.origin,
         top_origin: None,
         allow: vec![],
         extensions: None,
@@ -881,6 +906,7 @@ pub fn fido_auth_with_qr_bluetooth(
     msg_printer: &Arc<dyn MessagePrinter>,
     fido_challenge: String,
     fido_allow_list: Vec<String>,
+    authority_host: &str,
     timeout_ms: u64,
     prompt: &str,
     presence_prompt: &str,
@@ -895,6 +921,7 @@ pub fn fido_auth_with_qr_bluetooth(
             msg_printer,
             fido_challenge,
             fido_allow_list,
+            authority_host,
             timeout_ms,
             prompt,
             presence_prompt,
@@ -908,6 +935,7 @@ async fn fido_auth_with_qr_bluetooth_inner(
     msg_printer: &Arc<dyn MessagePrinter>,
     fido_challenge: String,
     fido_allow_list: Vec<String>,
+    authority_host: &str,
     timeout_ms: u64,
     prompt: &str,
     presence_prompt: &str,
@@ -919,12 +947,13 @@ async fn fido_auth_with_qr_bluetooth_inner(
             msg_printer.clone(),
             fido_challenge,
             fido_allow_list,
+            authority_host,
             timeout_ms,
             prompt,
             presence_prompt,
         ),
         check_bluetooth(),
-        || qr_bluetooth_fido_auth(msg_printer.clone(), qr_challenge, qr_prompt),
+        || qr_bluetooth_fido_auth(msg_printer.clone(), qr_challenge, authority_host, qr_prompt),
     )
     .await
 }
@@ -1491,6 +1520,14 @@ where
     ))
 }
 
+fn current_fido_authority_host(cfg: &HimmelblauConfig, account_id: &str) -> Result<String, String> {
+    // PAM initialization can discover and persist an alias after cfg was loaded.
+    let current = HimmelblauConfig::new(Some(&cfg.get_config_file()))?;
+    current
+        .get_authority_host_for_account(account_id)
+        .ok_or_else(|| "Cannot resolve authority host for FIDO account".to_string())
+}
+
 fn handle_pam_auth_response_fido(
     state: &AuthenticateState,
     fido_challenge: String,
@@ -1498,6 +1535,13 @@ fn handle_pam_auth_response_fido(
     has_physical_security_key: bool,
     has_cross_device: bool,
 ) -> PamWhatNext {
+    let authority_host = match current_fido_authority_host(&state.cfg, &state.account_id) {
+        Ok(host) => host,
+        Err(err) => {
+            error!("Failed to reload FIDO authority configuration: {}", err);
+            return PamWhatNext::Finish(PamResultCode::PAM_AUTH_ERR);
+        }
+    };
     let timeout_ms = state.cfg.get_fido_timeout().saturating_mul(1000);
     let budget = FidoBudget::new(timeout_ms);
     let fido_prompt = state.cfg.get_fido_prompt();
@@ -1527,6 +1571,7 @@ fn handle_pam_auth_response_fido(
                         &state.msg_printer,
                         fido_challenge,
                         fido_allow_list,
+                        &authority_host,
                         remaining_ms,
                         &fido_prompt,
                         &fido_presence_prompt,
@@ -1540,6 +1585,7 @@ fn handle_pam_auth_response_fido(
                         state.msg_printer.clone(),
                         fido_challenge,
                         fido_allow_list,
+                        &authority_host,
                         remaining_ms,
                         &fido_prompt,
                         &fido_presence_prompt,
@@ -1562,8 +1608,13 @@ fn handle_pam_auth_response_fido(
                 FidoAuthMethod::QrBluetooth => {
                     debug!("FIDO auth: attempting QR/Bluetooth");
                     failure_message = tr("QR/Bluetooth authentication failed.");
-                    qr_bluetooth_fido_auth(state.msg_printer.clone(), fido_challenge, &qr_prompt)
-                        .await?
+                    qr_bluetooth_fido_auth(
+                        state.msg_printer.clone(),
+                        fido_challenge,
+                        &authority_host,
+                        &qr_prompt,
+                    )
+                    .await?
                 }
                 FidoAuthMethod::SecurityKey | FidoAuthMethod::SecurityKeyAndQrBluetooth => {
                     error!("QR-only FIDO preparation selected an unavailable USB transport");
@@ -1995,6 +2046,43 @@ mod tests {
     use std::io::Error as IoError;
     use std::sync::Mutex;
 
+    #[test]
+    fn fido_relying_party_preserves_commercial_and_uses_other_authorities() {
+        assert_eq!(
+            fido_relying_party("login.microsoftonline.com"),
+            FidoRelyingParty {
+                id: "login.microsoft.com".to_string(),
+                origin: "https://login.microsoft.com".to_string(),
+            }
+        );
+        assert_eq!(
+            fido_relying_party("login.microsoftonline.us"),
+            FidoRelyingParty {
+                id: "login.microsoftonline.us".to_string(),
+                origin: "https://login.microsoftonline.us".to_string(),
+            }
+        );
+        assert_eq!(
+            fido_relying_party("login.example.net"),
+            FidoRelyingParty {
+                id: "login.example.net".to_string(),
+                origin: "https://login.example.net".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn fido_relying_party_normalizes_authority_host_case() {
+        assert_eq!(
+            fido_relying_party("LOGIN.MicrosoftOnline.US"),
+            fido_relying_party("login.microsoftonline.us")
+        );
+        assert_eq!(
+            fido_relying_party("LOGIN.MicrosoftOnline.COM"),
+            fido_relying_party("login.microsoftonline.com")
+        );
+    }
+
     fn create_temp_config(contents: &str) -> String {
         let file_path = format!(
             "/tmp/himmelblau_auth_test_config_{}.ini",
@@ -2007,6 +2095,37 @@ mod tests {
     fn test_config(contents: &str) -> HimmelblauConfig {
         let temp_file = create_temp_config(contents);
         HimmelblauConfig::new(Some(&temp_file)).unwrap()
+    }
+
+    #[test]
+    fn fido_authority_sees_aliases_persisted_after_initial_config_load() {
+        let initial = "[global]\ndomains = example.com\n[example.com]\nauthority_host = login.microsoftonline.us\n";
+        let path = create_temp_config(initial);
+        let cfg = HimmelblauConfig::new(Some(&path)).unwrap();
+        let account = "alice@alias.example.com";
+        assert_eq!(
+            cfg.get_authority_host_for_account(account),
+            Some("login.microsoftonline.com".to_string())
+        );
+        fs::write(
+            &path,
+            format!("{initial}domain_aliases = alias.example.com\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            current_fido_authority_host(&cfg, account),
+            Ok("login.microsoftonline.us".to_string())
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fido_authority_rejects_config_reload_errors() {
+        let path = create_temp_config("");
+        let cfg = HimmelblauConfig::new(Some(&path)).unwrap();
+        fs::write(&path, "[unterminated section").unwrap();
+        assert!(current_fido_authority_host(&cfg, "alice@example.com").is_err());
+        fs::remove_file(path).unwrap();
     }
 
     fn test_options(mfa_poll_prompt: bool) -> Options {
@@ -3768,7 +3887,7 @@ mod bluetooth_probe_tests {
                 header
                     .primary()
                     .flags()
-                    .contains(zbus::message::Flags::NoAutoStart),
+                    .contains(zbus::message::Flags::NO_AUTO_START),
                 Ordering::Release,
             );
             if self.stalled.load(Ordering::Acquire) {
@@ -3777,12 +3896,12 @@ mod bluetooth_probe_tests {
             let mut objects = zbus::fdo::ManagedObjects::new();
             if let Some(powered) = *self.powered.lock().unwrap() {
                 objects.insert(
-                    zbus::zvariant::OwnedObjectPath::try_from("/org/bluez/hci0").unwrap(),
-                    std::collections::HashMap::from([(
+                    zbus::OwnedObjectPath::try_from("/org/bluez/hci0").unwrap(),
+                    std::collections::BTreeMap::from([(
                         zbus::names::OwnedInterfaceName::try_from("org.bluez.Adapter1").unwrap(),
                         std::collections::HashMap::from([(
                             "Powered".into(),
-                            zbus::zvariant::OwnedValue::from(powered),
+                            zbus::OwnedVariant::from(powered),
                         )]),
                     )]),
                 );
@@ -3796,7 +3915,6 @@ mod bluetooth_probe_tests {
     async fn bluez_probe_does_not_auto_start_and_preserves_adapter_states() {
         let (_bus, address) = PrivateBus::start();
         let client = zbus::connection::Builder::address(address.as_str())
-            .unwrap()
             .build()
             .await
             .unwrap();
@@ -3812,9 +3930,7 @@ mod bluetooth_probe_tests {
         let no_auto_start = Arc::new(AtomicBool::new(false));
         let stalled = Arc::new(AtomicBool::new(false));
         let service = zbus::connection::Builder::address(address.as_str())
-            .unwrap()
             .name("org.bluez")
-            .unwrap()
             .serve_at(
                 "/",
                 BluezFixture {
@@ -3823,7 +3939,6 @@ mod bluetooth_probe_tests {
                     stalled: stalled.clone(),
                 },
             )
-            .unwrap()
             .build()
             .await
             .unwrap();

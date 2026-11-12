@@ -480,6 +480,56 @@ pub(crate) fn sealed_refresh_token_or<K: KeyStoreTxn>(
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum HelloPrtRenewalError {
+    Renewal(himmelblau::error::MsalError),
+    Persistence(IdpError),
+}
+
+/// Renew an aging (or cold-restored) PRT while the PIN has unlocked its
+/// Hello key. Do not expose the replacement until its protected copy is saved.
+#[macro_export]
+macro_rules! renew_decoupled_hello_prt {
+    ($self:expr, $account_id:expr, $prt:expr, $loaded_hello_key:expr, $keystore:expr, $tpm:expr, $machine_key:expr, $renewal:expr) => {
+        async {
+            use $crate::idprovider::common::HelloPrtRenewalError;
+            let renewed = if $self
+                .refresh_cache
+                .prt_age($account_id)
+                .await
+                .is_some_and(|age| age < $crate::idprovider::common::PRT_REFRESH_AGE)
+            {
+                None
+            } else {
+                let renewal: Result<
+                    kanidm_hsm_crypto::structures::SealedData,
+                    himmelblau::error::MsalError,
+                > = $renewal.await;
+                Some(renewal.map_err(HelloPrtRenewalError::Renewal)?)
+            };
+            let prt = renewed.as_ref().unwrap_or($prt);
+            let sealed = $self
+                .client
+                .lock()
+                .await
+                .seal_user_prt_with_loaded_ms_hello_key(prt, $loaded_hello_key, $tpm, $machine_key)
+                .map_err(|e| {
+                    tracing::error!(?e, "Failed to seal renewed Hello PRT");
+                    HelloPrtRenewalError::Persistence($crate::idprovider::interface::IdpError::Tpm)
+                })?;
+            $keystore
+                .insert_tagged_hsm_key(&$self.fetch_hello_prt_key_tag($account_id), &sealed)
+                .map_err(|e| {
+                    tracing::error!(?e, "Failed to persist renewed Hello PRT");
+                    HelloPrtRenewalError::Persistence(
+                        $crate::idprovider::interface::IdpError::KeyStore,
+                    )
+                })?;
+            Ok::<_, HelloPrtRenewalError>(renewed)
+        }
+    };
+}
+
 /// Persist the token's PRT, or its refresh token when it has no PRT, sealed
 /// with the loaded Hello key. Best effort: failures are logged, not returned.
 #[macro_export]
@@ -604,17 +654,13 @@ macro_rules! load_cached_prt {
                     error!("Failed to load hello prt: {:?}", e);
                     IdpError::Tpm
                 })?;
-            // Check if the cached PRT has expired.
-            // This happens after 14 days of no online contact.
+            // Enforce the server-issued PRT expiry while offline.
             if prt_expired {
                 return Ok(AuthResult::Denied(tr(
                     "Offline auth has expired. Please connect to the network to continue.",
                 )));
             }
-            $self
-                .refresh_cache
-                .add($account_id, &RefreshCacheEntry::Prt(prt.clone()))
-                .await;
+            $self.refresh_cache.add_reused_prt($account_id, &prt).await;
         }
     };
 }
@@ -630,21 +676,41 @@ macro_rules! load_cached_prt_no_op {
 macro_rules! load_cached_prt_for_try_unseal {
     ($loaded_hello_key:ident, $keytype:ident, $online:ident, $self:ident, $account_id:expr, $keystore:expr, $tpm:expr, $machine_key:expr) => {
         let hello_prt_tag = $self.fetch_hello_prt_key_tag($account_id);
-        if let Ok(Some(hello_prt)) = $keystore.get_tagged_hsm_key(&hello_prt_tag) {
-            let (mut prt, prt_expired) = $self
+        let cached = if let Ok(RefreshCacheEntry::Prt(prt)) =
+            $self.refresh_cache.refresh_token($account_id).await
+        {
+            let expired = $self
                 .client
                 .lock()
                 .await
-                .unseal_user_prt_with_loaded_ms_hello_key(
-                    &hello_prt,
-                    &$loaded_hello_key,
-                    $tpm,
-                    $machine_key,
-                )
+                .is_prt_expired(&prt, $tpm, $machine_key)
                 .map_err(|e| {
-                    error!("Failed to load hello prt: {:?}", e);
+                    error!(?e, "Failed to inspect cached PRT");
                     IdpError::Tpm
                 })?;
+            Some((prt, expired))
+        } else if let Ok(Some(hello_prt)) = $keystore.get_tagged_hsm_key(&hello_prt_tag) {
+            Some(
+                $self
+                    .client
+                    .lock()
+                    .await
+                    .unseal_user_prt_with_loaded_ms_hello_key(
+                        &hello_prt,
+                        &$loaded_hello_key,
+                        $tpm,
+                        $machine_key,
+                    )
+                    .map_err(|e| {
+                        error!("Failed to load hello prt: {:?}", e);
+                        IdpError::Tpm
+                    })?,
+            )
+        } else {
+            None
+        };
+        if let Some((mut prt, prt_expired)) = cached {
+            let mut renewed = false;
             if prt_expired {
                 if !$crate::idprovider::common::should_renew_expired_try_unseal_prt(
                     &$keytype, $online,
@@ -696,11 +762,56 @@ macro_rules! load_cached_prt_for_try_unseal {
                     $machine_key
                 );
                 prt = renewed_prt;
+                renewed = true;
+            } else if $online && matches!($keytype, $crate::idprovider::common::KeyType::Decoupled)
+            {
+                match $crate::renew_decoupled_hello_prt!(
+                    $self,
+                    $account_id,
+                    &prt,
+                    &$loaded_hello_key,
+                    $keystore,
+                    $tpm,
+                    $machine_key,
+                    $self
+                        .client
+                        .lock()
+                        .await
+                        .exchange_prt_for_prt(&prt, $tpm, $machine_key, true,)
+                )
+                .await
+                {
+                    Ok(Some(replacement)) => {
+                        prt = replacement;
+                        renewed = true;
+                    }
+                    Ok(None) => {}
+                    Err($crate::idprovider::common::HelloPrtRenewalError::Renewal(
+                        himmelblau::error::MsalError::RequestFailed(msg),
+                    )) => {
+                        error!(?msg, "Network down while renewing Hello PRT");
+                        *$self.state.lock().await =
+                            $crate::idprovider::interface::CacheState::OfflineNextCheck(
+                                std::time::SystemTime::now() + OFFLINE_NEXT_CHECK,
+                            );
+                    }
+                    Err($crate::idprovider::common::HelloPrtRenewalError::Renewal(e)) => {
+                        error!(?e, "Failed to renew Hello PRT during try_unseal");
+                        return Ok(false);
+                    }
+                    Err($crate::idprovider::common::HelloPrtRenewalError::Persistence(e)) => {
+                        return Err(e);
+                    }
+                }
             }
-            $self
-                .refresh_cache
-                .add($account_id, &RefreshCacheEntry::Prt(prt))
-                .await;
+            if renewed {
+                $self
+                    .refresh_cache
+                    .add($account_id, &RefreshCacheEntry::Prt(prt))
+                    .await;
+            } else {
+                $self.refresh_cache.add_reused_prt($account_id, &prt).await;
+            }
         }
     };
 }
@@ -1873,6 +1984,7 @@ mod tests {
 
     const TEST_HELLO_PIN: &str = "123456";
     const TEST_ACCOUNT_ID: &str = "testuser@example.com";
+    const OFFLINE_NEXT_CHECK: Duration = Duration::from_secs(15);
 
     #[derive(Default)]
     struct RecordingKeyStore {
@@ -1914,11 +2026,38 @@ mod tests {
 
     struct ResealHarness {
         client: tokio::sync::Mutex<BrokerClientApplication>,
+        refresh_cache: RefreshCache,
+        state: tokio::sync::Mutex<CacheState>,
     }
 
     #[allow(dead_code)]
     impl ResealHarness {
         crate::impl_himmelblau_hello_key_helpers!();
+
+        async fn restore_prt_with_pin(
+            &self,
+            hello_key: &LoadableMsHelloKey,
+            pin: &str,
+            keystore: &mut RecordingKeyStore,
+            tpm: &mut BoxedDynTpm,
+            machine_key: &StorageKey,
+        ) -> Result<bool, IdpError> {
+            let loaded = LoadedMsHelloKey::load(hello_key, pin, tpm, machine_key)
+                .map_err(|_| IdpError::Tpm)?;
+            let keytype = KeyType::Decoupled;
+            let online = false;
+            crate::load_cached_prt_for_try_unseal!(
+                loaded,
+                keytype,
+                online,
+                self,
+                TEST_ACCOUNT_ID,
+                keystore,
+                tpm,
+                machine_key
+            );
+            Ok(true)
+        }
     }
 
     fn reseal_harness() -> anyhow::Result<ResealHarness> {
@@ -1927,6 +2066,8 @@ mod tests {
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         Ok(ResealHarness {
             client: tokio::sync::Mutex::new(client),
+            refresh_cache: RefreshCache::new(),
+            state: tokio::sync::Mutex::new(CacheState::Online),
         })
     }
 
@@ -2284,6 +2425,228 @@ mod tests {
         assert!(tpm
             .unseal_data(other_loaded_hello_key.storage_key(), &hello_prt)
             .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pin_renewal_survives_a_cold_restart() -> anyhow::Result<()> {
+        let (mut tpm, machine_key, hello_key) = soft_tpm_with_hello_key()?;
+        let (harness, old_prt) = harness_with_host_sealed_prt(&mut tpm, &machine_key)?;
+        let loaded = load_hello_key(&hello_key, TEST_HELLO_PIN, &mut tpm, &machine_key)?;
+        let mut keystore = RecordingKeyStore::default();
+        let token = user_token(Some(old_prt.clone()))?;
+        crate::cache_token_with_loaded_hello_key!(
+            harness,
+            TEST_ACCOUNT_ID,
+            token,
+            &loaded,
+            &mut keystore,
+            &mut tpm,
+            &machine_key
+        );
+        let old_plain = harness
+            .client
+            .lock()
+            .await
+            .seal_user_prt_with_loaded_ms_hello_key(&old_prt, &loaded, &mut tpm, &machine_key)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let mut renewed_plain: serde_json::Value = serde_json::from_slice(
+            &tpm.unseal_data(loaded.storage_key(), &old_plain)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+        )?;
+        renewed_plain["refresh_token"] = "renewed-prt".into();
+        let sealed = tpm
+            .seal_data(
+                loaded.storage_key(),
+                Zeroizing::new(serde_json::to_vec(&renewed_plain)?),
+            )
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let (renewed_prt, _) = harness
+            .client
+            .lock()
+            .await
+            .unseal_user_prt_with_loaded_ms_hello_key(&sealed, &loaded, &mut tpm, &machine_key)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+        let renewed = crate::renew_decoupled_hello_prt!(
+            harness,
+            TEST_ACCOUNT_ID,
+            &old_prt,
+            &loaded,
+            &mut keystore,
+            &mut tpm,
+            &machine_key,
+            async { Ok::<_, himmelblau::error::MsalError>(renewed_prt) }
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert!(renewed.is_some(), "a disk-restored PRT must be renewed");
+        drop(loaded);
+        let cold = ResealHarness {
+            client: harness.client,
+            refresh_cache: RefreshCache::new(),
+            state: tokio::sync::Mutex::new(CacheState::Online),
+        };
+        assert!(cold
+            .refresh_cache
+            .refresh_token(TEST_ACCOUNT_ID)
+            .await
+            .is_err());
+        assert!(cold
+            .restore_prt_with_pin(
+                &hello_key,
+                "wrong-pin",
+                &mut keystore,
+                &mut tpm,
+                &machine_key
+            )
+            .await
+            .is_err());
+        assert!(cold
+            .restore_prt_with_pin(
+                &hello_key,
+                TEST_HELLO_PIN,
+                &mut keystore,
+                &mut tpm,
+                &machine_key
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?);
+        assert!(matches!(
+            cold.refresh_cache.refresh_token(TEST_ACCOUNT_ID).await,
+            Ok(RefreshCacheEntry::Prt(_))
+        ));
+        let loaded = load_hello_key(&hello_key, TEST_HELLO_PIN, &mut tpm, &machine_key)?;
+        let persisted: SealedData = keystore
+            .get_tagged_hsm_key(&cold.fetch_hello_prt_key_tag(TEST_ACCOUNT_ID))
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?
+            .ok_or_else(|| anyhow::anyhow!("renewed PRT was not persisted"))?;
+        let plain = tpm
+            .unseal_data(loaded.storage_key(), &persisted)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let plain: serde_json::Value = serde_json::from_slice(&plain)?;
+        assert_eq!(plain["refresh_token"], "renewed-prt");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pin_renewal_is_due_at_four_hours_but_not_for_a_fresh_prt() -> anyhow::Result<()> {
+        let (mut tpm, machine_key, hello_key) = soft_tpm_with_hello_key()?;
+        let (harness, prt) = harness_with_host_sealed_prt(&mut tpm, &machine_key)?;
+        let loaded = load_hello_key(&hello_key, TEST_HELLO_PIN, &mut tpm, &machine_key)?;
+        let mut keystore = RecordingKeyStore::default();
+        harness
+            .refresh_cache
+            .add(TEST_ACCOUNT_ID, &RefreshCacheEntry::Prt(prt.clone()))
+            .await;
+        let original_age = harness.refresh_cache.export_broker_prts().await?;
+        let result = crate::renew_decoupled_hello_prt!(
+            harness,
+            TEST_ACCOUNT_ID,
+            &prt,
+            &loaded,
+            &mut keystore,
+            &mut tpm,
+            &machine_key,
+            async { panic!("fresh PRT must not be renewed") }
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert!(result.is_none());
+        assert_eq!(
+            keystore.inserted_tags,
+            vec![harness.fetch_hello_prt_key_tag(TEST_ACCOUNT_ID)]
+        );
+        assert_eq!(
+            harness.refresh_cache.export_broker_prts().await?,
+            original_age
+        );
+
+        let issued = (SystemTime::now() - super::PRT_REFRESH_AGE)
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_secs();
+        harness
+            .refresh_cache
+            .import_broker_prts(&serde_json::to_vec(&HashMap::from([(
+                TEST_ACCOUNT_ID,
+                (&prt, issued),
+            )]))?)
+            .await?;
+        let result = crate::renew_decoupled_hello_prt!(
+            harness,
+            TEST_ACCOUNT_ID,
+            &prt,
+            &loaded,
+            &mut keystore,
+            &mut tpm,
+            &machine_key,
+            async { Ok::<_, himmelblau::error::MsalError>(prt.clone()) }
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert!(
+            result.is_some(),
+            "four-hour-old PRT must be renewed and persisted"
+        );
+        assert_eq!(keystore.inserted_tags.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pin_renewal_failures_do_not_replace_the_protected_credential() -> anyhow::Result<()> {
+        let (mut tpm, machine_key, hello_key) = soft_tpm_with_hello_key()?;
+        let (harness, prt) = harness_with_host_sealed_prt(&mut tpm, &machine_key)?;
+        let loaded = load_hello_key(&hello_key, TEST_HELLO_PIN, &mut tpm, &machine_key)?;
+        let mut keystore = RecordingKeyStore::default();
+        let token = user_token(Some(prt.clone()))?;
+        crate::cache_token_with_loaded_hello_key!(
+            harness,
+            TEST_ACCOUNT_ID,
+            token,
+            &loaded,
+            &mut keystore,
+            &mut tpm,
+            &machine_key
+        );
+        let original = keystore.entries.clone();
+        for error in [
+            himmelblau::error::MsalError::MFARequired,
+            himmelblau::error::MsalError::RequestFailed("network unavailable".into()),
+        ] {
+            let result = crate::renew_decoupled_hello_prt!(
+                harness,
+                TEST_ACCOUNT_ID,
+                &prt,
+                &loaded,
+                &mut keystore,
+                &mut tpm,
+                &machine_key,
+                async { Err::<SealedData, _>(error) }
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(super::HelloPrtRenewalError::Renewal(_))
+            ));
+            assert_eq!(keystore.entries, original);
+        }
+        keystore.fail_insert = true;
+        let result = crate::renew_decoupled_hello_prt!(
+            harness,
+            TEST_ACCOUNT_ID,
+            &prt,
+            &loaded,
+            &mut keystore,
+            &mut tpm,
+            &machine_key,
+            async { Ok::<_, himmelblau::error::MsalError>(prt.clone()) }
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(super::HelloPrtRenewalError::Persistence(IdpError::KeyStore))
+        ));
+        assert_eq!(keystore.entries, original);
         Ok(())
     }
 

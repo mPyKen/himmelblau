@@ -15,6 +15,15 @@ The PAM and NSS modules communicate with Entra ID via the himmelblaud daemon. Hi
 supports Intune device enrollment, policy enforcement, and marking devices as compliant with
 Intune MDM policies.
 
+For decoupled Linux Hello credentials, online PIN authentication renews the PRT
+after four hours, or after a cold start when its renewal age is unknown. The
+replacement is sealed with the unlocked Hello key and persisted before use, so
+a full reboot does not restore an obsolete PRT. This applies to PAM login and
+the broker's PIN-unlock path. Background broker renewal still
+uses the in-memory cache; the next successful PIN authentication also saves that
+cached credential. No PIN or unlocked key is retained for background renewal.
+Entra revocation and interactive reauthentication policies still apply.
+
 [![Azure Entra Id Authentication for Linux](img/sambaxp.png)](https://youtu.be/wCibnqVQ_bs "Azure Entra Id Authentication for Linux")
 
 ## Sponsorship

@@ -39,6 +39,11 @@
 
 Configuring PAM ensures authentication requests go through Entra ID when appropriate.
 
+Cancelling passkey authentication ends the current Himmelblau attempt and stops
+its active passkey transports. The PAM application's stack controls determine
+whether authentication then continues through another module; cancellation does
+not force the entire PAM stack to stop.
+
 ## Automatic setup
 
 On Ubuntu/Debian:
@@ -120,7 +125,9 @@ password	required	pam_deny.so
   The user did not meet the required credential policy.
 
 - **PAM_ABORT**  
-  A critical, unrecoverable failure occurred—such as a panic inside the `himmelblaud` service.
+  The Himmelblau attempt was cancelled, or a critical, unrecoverable failure
+  occurred, such as a panic inside the `himmelblaud` service. The configured PAM
+  controls determine whether this stops the stack or permits fallback.
 
 # SEE ALSO
 

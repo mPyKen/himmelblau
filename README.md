@@ -24,6 +24,14 @@ uses the in-memory cache; the next successful PIN authentication also saves that
 cached credential. No PIN or unlocked key is retained for background renewal.
 Entra revocation and interactive reauthentication policies still apply.
 
+WorkIQ's initial Linux MSAL token request may omit its account. For the WorkIQ
+client only, the session broker queries the daemon's UID-scoped account list
+and supplies a uniquely matching account when neither supported account field
+is supplied. A non-empty username hint must match that list; explicit accounts
+are preserved and remain subject to the daemon's UID identity check. Other
+clients continue to require an account. Scopes, redirect URIs, PIN unlock, and
+Entra consent and policy checks are unchanged; no browser fallback is added.
+
 [![Azure Entra Id Authentication for Linux](img/sambaxp.png)](https://youtu.be/wCibnqVQ_bs "Azure Entra Id Authentication for Linux")
 
 ## Sponsorship

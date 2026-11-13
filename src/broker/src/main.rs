@@ -328,6 +328,52 @@ struct InteractiveSessionBroker {
     cfg: Arc<HimmelblauConfig>,
 }
 
+fn prepare_workiq_token_request(
+    request_json: &str,
+    get_accounts: impl FnOnce() -> Result<String, dbus::MethodErr>,
+) -> Result<String, dbus::MethodErr> {
+    let mut request: serde_json::Value = serde_json::from_str(request_json)
+        .map_err(|e| dbus::MethodErr::failed(&format!("Invalid token request JSON: {}", e)))?;
+    let parameters = &request["authParameters"];
+    if parameters["clientId"].as_str() != Some("ba081686-5d24-4bc6-a0d6-d034ecffed87")
+        || !request["account"].is_null()
+        || !parameters["account"].is_null()
+    {
+        return Ok(request_json.to_string());
+    }
+    let hint = match &parameters["username"] {
+        serde_json::Value::Null => "",
+        serde_json::Value::String(value) => value.as_str(),
+        _ => return Err(dbus::MethodErr::failed(&"Invalid WorkIQ username hint")),
+    };
+    // getAccounts is resolved by the daemon using this connection's peer UID.
+    let response: serde_json::Value = serde_json::from_str(&get_accounts()?)
+        .map_err(|e| dbus::MethodErr::failed(&format!("Invalid account response JSON: {}", e)))?;
+    let accounts = response["accounts"]
+        .as_array()
+        .ok_or_else(|| dbus::MethodErr::failed(&"Invalid broker account list"))?;
+    let mut selected = None;
+    for account in accounts {
+        let username = account["username"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| dbus::MethodErr::failed(&"Invalid broker account username"))?;
+        if hint.is_empty() || hint.to_lowercase() == username.to_lowercase() {
+            if selected.is_some() {
+                return Err(dbus::MethodErr::failed(
+                    &"No unique broker account matches the WorkIQ request",
+                ));
+            }
+            selected = Some(account);
+        }
+    }
+    let account = selected
+        .ok_or_else(|| dbus::MethodErr::failed(&"No broker account matches the WorkIQ request"))?;
+    request["authParameters"]["account"] = account.clone();
+    serde_json::to_string(&request)
+        .map_err(|e| dbus::MethodErr::failed(&format!("Token request JSON encode: {}", e)))
+}
+
 impl InteractiveSessionBroker {
     /// Construct the serde JSON for a broker ClientRequest variant
     /// and forward it to the himmelblaud broker socket.
@@ -393,6 +439,7 @@ impl InteractiveSessionBroker {
             .ok()
             .and_then(|v| {
                 v.get("account")
+                    .filter(|account| !account.is_null())
                     .or_else(|| v.get("authParameters").and_then(|ap| ap.get("account")))
                     .and_then(|a| a.get("username"))
                     .and_then(|u| u.as_str())
@@ -463,6 +510,13 @@ impl SessionBroker for InteractiveSessionBroker {
         correlation_id: String,
         request_json: String,
     ) -> Result<String, dbus::MethodErr> {
+        let request_json = prepare_workiq_token_request(&request_json, || {
+            self.get_accounts(
+                protocol_version.clone(),
+                correlation_id.clone(),
+                r#"{"clientId":"ba081686-5d24-4bc6-a0d6-d034ecffed87"}"#.to_string(),
+            )
+        })?;
         // Extract the username from the request for authenticate()
         let account_id = Self::extract_account_id(&request_json)
             .ok_or_else(|| dbus::MethodErr::failed(&"Missing account username in request"))?;
@@ -480,6 +534,13 @@ impl SessionBroker for InteractiveSessionBroker {
         correlation_id: String,
         request_json: String,
     ) -> Result<String, dbus::MethodErr> {
+        let request_json = prepare_workiq_token_request(&request_json, || {
+            self.get_accounts(
+                protocol_version.clone(),
+                correlation_id.clone(),
+                r#"{"clientId":"ba081686-5d24-4bc6-a0d6-d034ecffed87"}"#.to_string(),
+            )
+        })?;
         self.forward(
             "acquireTokenSilently",
             &[&protocol_version, &correlation_id, &request_json],
@@ -711,6 +772,128 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn workiq_request() -> serde_json::Value {
+        serde_json::json!({
+            "authParameters": {
+                "account": null,
+                "clientId": "ba081686-5d24-4bc6-a0d6-d034ecffed87",
+                "username": "",
+                "requestedScopes": ["api://workiq.svc.cloud.microsoft/.default"],
+                "redirectUri": "https://login.microsoftonline.com/common/oauth2/nativeclient",
+                "decodedClaims": "unchanged",
+                "popParams": null
+            }
+        })
+    }
+
+    fn broker_accounts(usernames: &[&str]) -> String {
+        serde_json::json!({
+            "accounts": usernames.iter().map(|username| serde_json::json!({
+                "username": username, "realm": "test-tenant"
+            })).collect::<Vec<_>>()
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn workiq_account_supplies_uid_scoped_account_and_preserves_parameters() {
+        for root_null in [false, true] {
+            for missing in [false, true] {
+                let mut value = workiq_request();
+                if root_null {
+                    value["account"] = serde_json::Value::Null;
+                }
+                if missing {
+                    value["authParameters"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("account");
+                }
+                let mut lookups = 0;
+                let prepared = prepare_workiq_token_request(&value.to_string(), || {
+                    lookups += 1;
+                    Ok(broker_accounts(&["alice@example.com"]))
+                })
+                .unwrap();
+                assert_eq!(lookups, 1);
+                assert_eq!(
+                    InteractiveSessionBroker::extract_account_id(&prepared).as_deref(),
+                    Some("alice@example.com")
+                );
+                value["authParameters"]["account"] =
+                    serde_json::json!({"username": "alice@example.com", "realm": "test-tenant"});
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&prepared).unwrap(),
+                    value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn workiq_account_honors_hint_and_refuses_missing_or_ambiguous_accounts() {
+        for (hint, accounts, expected) in [
+            (
+                "ALICE@example.com",
+                vec!["alice@example.com", "bob@example.com"],
+                Some("alice@example.com"),
+            ),
+            ("bob@example.com", vec!["alice@example.com"], None),
+            ("", vec![], None),
+            ("", vec!["alice@example.com", "bob@example.com"], None),
+        ] {
+            let mut value = workiq_request();
+            value["authParameters"]["username"] = serde_json::json!(hint);
+            let result =
+                prepare_workiq_token_request(&value.to_string(), || Ok(broker_accounts(&accounts)));
+            if let Some(expected) = expected {
+                assert_eq!(
+                    InteractiveSessionBroker::extract_account_id(&result.unwrap()).as_deref(),
+                    Some(expected)
+                );
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn workiq_account_preserves_explicit_accounts_and_other_clients() {
+        let mut explicit = workiq_request();
+        explicit["authParameters"]["account"] =
+            serde_json::json!({"username":"chosen@example.com"});
+        let mut root = workiq_request();
+        root["account"] = serde_json::json!({"username":"chosen@example.com"});
+        let mut other = workiq_request();
+        other["authParameters"]["clientId"] = serde_json::json!("another-client");
+        for value in [explicit, root, other] {
+            let original = value.to_string();
+            let prepared =
+                prepare_workiq_token_request(&original, || panic!("Unexpected account lookup"))
+                    .unwrap();
+            assert_eq!(prepared, original);
+        }
+    }
+
+    #[test]
+    fn workiq_account_propagates_lookup_errors_and_rejects_malformed_responses() {
+        let request = workiq_request().to_string();
+        assert!(prepare_workiq_token_request(&request, || {
+            Err(dbus::MethodErr::failed(&"Synthetic account lookup failure"))
+        })
+        .is_err());
+        for reply in [
+            "not JSON",
+            "{}",
+            r#"{"accounts":"invalid"}"#,
+            r#"{"accounts":[{"realm":"test-tenant"}]}"#,
+            r#"{"accounts":[{"username":""}]}"#,
+            r#"{"accounts":[{"username":"alice@example.com"}],"trailing":true} trailing"#,
+        ] {
+            assert!(prepare_workiq_token_request(&request, || Ok(reply.to_string())).is_err());
+        }
+    }
 
     #[test]
     fn extracts_top_level_account() {

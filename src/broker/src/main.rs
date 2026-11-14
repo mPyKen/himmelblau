@@ -496,11 +496,21 @@ fn prepare_workiq_token_request(
     let mut request: serde_json::Value = serde_json::from_str(request_json)
         .map_err(|e| dbus::MethodErr::failed(&format!("Invalid token request JSON: {}", e)))?;
     let parameters = &request["authParameters"];
-    if parameters["clientId"].as_str() != Some("ba081686-5d24-4bc6-a0d6-d034ecffed87")
-        || !request["account"].is_null()
-        || !parameters["account"].is_null()
-    {
+    if parameters["clientId"].as_str() != Some("ba081686-5d24-4bc6-a0d6-d034ecffed87") {
         return Ok(request_json.to_string());
+    }
+    // WorkIQ supplies its embedded-browser URI even for broker acquisition.
+    // Entra's PRT exchange requires the registered broker redirect instead.
+    if parameters["redirectUri"].as_str()
+        == Some("https://login.microsoftonline.com/common/oauth2/nativeclient")
+    {
+        request["authParameters"]["redirectUri"] = serde_json::json!(
+            "ms-appx-web://microsoft.aad.brokerplugin/ba081686-5d24-4bc6-a0d6-d034ecffed87"
+        );
+    }
+    let parameters = &request["authParameters"];
+    if !request["account"].is_null() || !parameters["account"].is_null() {
+        return Ok(request.to_string());
     }
     let hint = match &parameters["username"] {
         serde_json::Value::Null => "",
@@ -533,6 +543,23 @@ fn prepare_workiq_token_request(
     request["authParameters"]["account"] = account.clone();
     serde_json::to_string(&request)
         .map_err(|e| dbus::MethodErr::failed(&format!("Token request JSON encode: {}", e)))
+}
+
+fn complete_broker_token_response(response: String) -> Result<String, dbus::MethodErr> {
+    let mut parsed: serde_json::Value = serde_json::from_str(&response)
+        .map_err(|e| dbus::MethodErr::failed(&format!("Invalid token response JSON: {}", e)))?;
+    if let Some(error) = parsed.pointer_mut("/brokerTokenResponse/error") {
+        let error = error
+            .as_object_mut()
+            .ok_or_else(|| dbus::MethodErr::failed(&"Invalid broker token error"))?;
+        if !error.contains_key("tag") {
+            // identity_dbus_broker 0.2.1 omits the native runtime's required
+            // diagnostic tag. Zero denotes an unspecified tag, not success.
+            error.insert("tag".to_string(), serde_json::json!(0));
+            return Ok(parsed.to_string());
+        }
+    }
+    Ok(response)
 }
 
 impl InteractiveSessionBroker {
@@ -686,10 +713,10 @@ impl SessionBroker for InteractiveSessionBroker {
                 r#"{"clientId":"ba081686-5d24-4bc6-a0d6-d034ecffed87"}"#.to_string(),
             )
         })?;
-        self.forward(
+        complete_broker_token_response(self.forward(
             "acquireTokenSilently",
             &[&protocol_version, &correlation_id, &request_json],
-        )
+        )?)
     }
 
     fn get_accounts(
@@ -980,6 +1007,9 @@ mod tests {
                 );
                 value["authParameters"]["account"] =
                     serde_json::json!({"username": "alice@example.com", "realm": "test-tenant"});
+                value["authParameters"]["redirectUri"] = serde_json::json!(
+                    "ms-appx-web://microsoft.aad.brokerplugin/ba081686-5d24-4bc6-a0d6-d034ecffed87"
+                );
                 assert_eq!(
                     serde_json::from_str::<serde_json::Value>(&prepared).unwrap(),
                     value
@@ -1020,8 +1050,10 @@ mod tests {
         let mut explicit = workiq_request();
         explicit["authParameters"]["account"] =
             serde_json::json!({"username":"chosen@example.com"});
+        explicit["authParameters"]["redirectUri"] = serde_json::json!("http://localhost");
         let mut root = workiq_request();
         root["account"] = serde_json::json!({"username":"chosen@example.com"});
+        root["authParameters"]["redirectUri"] = serde_json::json!("http://localhost");
         let mut other = workiq_request();
         other["authParameters"]["clientId"] = serde_json::json!("another-client");
         for value in [explicit, root, other] {
@@ -1050,6 +1082,112 @@ mod tests {
         ] {
             assert!(prepare_workiq_token_request(&request, || Ok(reply.to_string())).is_err());
         }
+    }
+
+    #[test]
+    fn workiq_redirect_uses_registered_broker_uri_with_or_without_explicit_account() {
+        for location in ["missing", "root", "nested"] {
+            let mut request = workiq_request();
+            let account = serde_json::json!({"username": "alice@example.com"});
+            match location {
+                "root" => request["account"] = account,
+                "nested" => request["authParameters"]["account"] = account,
+                _ => {}
+            }
+            let prepared = prepare_workiq_token_request(&request.to_string(), || {
+                assert_eq!(location, "missing");
+                Ok(broker_accounts(&["alice@example.com"]))
+            })
+            .unwrap();
+            let prepared: serde_json::Value = serde_json::from_str(&prepared).unwrap();
+            assert_eq!(
+                prepared["authParameters"]["redirectUri"],
+                "ms-appx-web://microsoft.aad.brokerplugin/ba081686-5d24-4bc6-a0d6-d034ecffed87"
+            );
+            assert_eq!(
+                prepared["authParameters"]["requestedScopes"],
+                request["authParameters"]["requestedScopes"]
+            );
+            assert_eq!(
+                prepared["authParameters"]["decodedClaims"],
+                request["authParameters"]["decodedClaims"]
+            );
+        }
+    }
+
+    #[test]
+    fn workiq_redirect_preserves_custom_redirects_and_other_clients() {
+        for uri in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("http://localhost"),
+            serde_json::json!("https://example.com/callback"),
+        ] {
+            let mut request = workiq_request();
+            request["authParameters"]["account"] =
+                serde_json::json!({"username": "alice@example.com"});
+            request["authParameters"]["redirectUri"] = uri;
+            let original = request.to_string();
+            assert_eq!(
+                prepare_workiq_token_request(&original, || panic!("Unexpected lookup")).unwrap(),
+                original
+            );
+        }
+        let mut request = workiq_request();
+        request["authParameters"]["clientId"] = serde_json::json!("other-client");
+        let original = request.to_string();
+        assert_eq!(
+            prepare_workiq_token_request(&original, || panic!("Unexpected lookup")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn token_error_response_supplies_missing_tag_without_hiding_failure() {
+        let response = serde_json::json!({
+            "brokerTokenResponse": {
+                "error": {"context": "Failed to authenticate user", "status": 0, "subStatus": 0}
+            }
+        });
+        let completed = complete_broker_token_response(response.to_string()).unwrap();
+        let completed: serde_json::Value = serde_json::from_str(&completed).unwrap();
+        assert_eq!(completed["brokerTokenResponse"]["error"]["tag"], 0);
+        assert_eq!(
+            completed["brokerTokenResponse"]["error"]["context"],
+            response["brokerTokenResponse"]["error"]["context"]
+        );
+        assert!(completed["brokerTokenResponse"]
+            .get("accessToken")
+            .is_none());
+        assert_eq!(
+            completed["brokerTokenResponse"]["error"]["status"],
+            response["brokerTokenResponse"]["error"]["status"]
+        );
+        assert_eq!(
+            completed["brokerTokenResponse"]["error"]["subStatus"],
+            response["brokerTokenResponse"]["error"]["subStatus"]
+        );
+    }
+
+    #[test]
+    fn token_error_response_preserves_existing_tags_and_success_payloads() {
+        for response in [
+            serde_json::json!({"brokerTokenResponse": {
+                "error": {"context": "Rejected", "status": 1, "subStatus": 2, "tag": 123}
+            }}),
+            serde_json::json!({"brokerTokenResponse": {"accessToken": "synthetic-token"}}),
+        ] {
+            let original = response.to_string();
+            assert_eq!(
+                complete_broker_token_response(original.clone()).unwrap(),
+                original
+            );
+        }
+        assert!(complete_broker_token_response("not JSON".to_string()).is_err());
+        assert!(complete_broker_token_response(
+            serde_json::json!({"brokerTokenResponse": {"error": "invalid"}}).to_string()
+        )
+        .is_err());
     }
 
     #[test]

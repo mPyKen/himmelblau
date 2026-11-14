@@ -29,8 +29,13 @@ client only, the session broker queries the daemon's UID-scoped account list
 and supplies a uniquely matching account when neither supported account field
 is supplied. A non-empty username hint must match that list; explicit accounts
 are preserved and remain subject to the daemon's UID identity check. Other
-clients continue to require an account. Scopes, redirect URIs, PIN unlock, and
-Entra consent and policy checks are unchanged; no browser fallback is added.
+clients continue to require an account. For WorkIQ only, its default
+`https://login.microsoftonline.com/common/oauth2/nativeclient` redirect is mapped
+to the registered `ms-appx-web://microsoft.aad.brokerplugin/<WorkIQ client ID>`
+redirect for PRT token exchange; custom redirects are preserved. Token error
+replies include the native runtime's required diagnostic `tag`, without changing
+their failure status or context. Scopes, PIN unlock, and Entra consent and policy
+checks are unchanged; no browser fallback is added.
 
 [![Azure Entra Id Authentication for Linux](img/sambaxp.png)](https://youtu.be/wCibnqVQ_bs "Azure Entra Id Authentication for Linux")
 
